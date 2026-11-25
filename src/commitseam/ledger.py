@@ -118,18 +118,23 @@ class QueueLedger:
             timeout=self.busy_timeout_ms / 1000.0,
             isolation_level=None,
         )
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=FULL;")
-        conn.execute(f"PRAGMA busy_timeout={int(self.busy_timeout_ms)};")
-        conn.execute("PRAGMA foreign_keys=ON;")
-        return conn
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=FULL;")
+            conn.execute(f"PRAGMA busy_timeout={int(self.busy_timeout_ms)};")
+            conn.execute("PRAGMA foreign_keys=ON;")
+            return conn
+        except Exception:
+            conn.close()
+            raise
 
     def _run_with_busy_retry(self, fn: Callable[[sqlite3.Connection], T]) -> T:
         last_exc: sqlite3.OperationalError | None = None
         for attempt in range(self.max_busy_retries + 1):
-            conn = self._connect()
+            conn: sqlite3.Connection | None = None
             try:
+                conn = self._connect()
                 return fn(conn)
             except sqlite3.OperationalError as exc:
                 msg = str(exc).lower()
@@ -140,7 +145,8 @@ class QueueLedger:
                         continue
                 raise
             finally:
-                conn.close()
+                if conn is not None:
+                    conn.close()
         assert last_exc is not None
         raise last_exc
 
@@ -342,6 +348,37 @@ class QueueLedger:
                         None,
                     )
 
+                expected_row = conn.execute(
+                    """
+                    SELECT payload_digest
+                    FROM expected_items
+                    WHERE request_id = ? AND item_id = ?
+                    """,
+                    (request_id, item_id),
+                ).fetchone()
+                if expected_row is not None and str(expected_row["payload_digest"]) != payload_digest:
+                    conn.execute(
+                        """
+                        INSERT INTO attempt_events
+                            (request_id, item_id, attempt_id, session_id, fault_seam, result, job_id, error_code, detail)
+                        VALUES (?, ?, ?, ?, ?, 'conflict', NULL, 'ERR_PAYLOAD_CONFLICT', 'expected_payload_digest_mismatch')
+                        """,
+                        (request_id, item_id, attempt_id, session_id, seam.value),
+                    )
+                    conn.execute("COMMIT")
+                    return (
+                        EnqueueResult(
+                            action="conflict",
+                            request_id=request_id,
+                            item_id=item_id,
+                            job_id=None,
+                            recovered_job_id=None,
+                            created_by_attempt_id=None,
+                            error_code="ERR_PAYLOAD_CONFLICT",
+                        ),
+                        None,
+                    )
+
                 job_id = f"job-{uuid.uuid4().hex[:12]}"
                 conn.execute(
                     """
@@ -439,27 +476,110 @@ class QueueLedger:
 
         return self._run_with_busy_retry(_op)
 
-    def reconcile(self, request_id: str) -> dict[str, Any]:
-        expected = self.expected_items(request_id)
-        jobs = self.committed_jobs(request_id)
-        pending = self.pending_items(request_id)
-        events = self.attempt_events(request_id)
-
-        expected_ids = {row["item_id"] for row in expected}
+    @staticmethod
+    def _build_reconcile_summary(
+        request_id: str,
+        expected: list[dict[str, str]],
+        jobs: list[dict[str, Any]],
+        events: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        expected_by_id = {row["item_id"]: row for row in expected}
         committed_ids = [row["item_id"] for row in jobs]
-        has_duplicates = len(committed_ids) != len(set(committed_ids))
+        committed_set = set(committed_ids)
+        pending_ids = [row["item_id"] for row in expected if row["item_id"] not in committed_set]
+        has_duplicates = len(committed_ids) != len(committed_set)
+        digest_mismatches = [
+            row["item_id"]
+            for row in jobs
+            if row["item_id"] in expected_by_id
+            and row["payload_digest"] != expected_by_id[row["item_id"]]["payload_digest"]
+        ]
+        unknown_request = len(expected) == 0
         exact_once_ok = (
-            not has_duplicates
-            and len(pending) == 0
-            and set(committed_ids) == expected_ids
+            not unknown_request
+            and not has_duplicates
+            and len(pending_ids) == 0
+            and len(digest_mismatches) == 0
+            and committed_set == set(expected_by_id)
         )
         return {
             "request_id": request_id,
+            "unknown_request": unknown_request,
             "expected_count": len(expected),
             "committed_enqueue_count": len(jobs),
-            "pending_item_ids": [row["item_id"] for row in pending],
+            "pending_item_ids": pending_ids,
             "has_duplicates": has_duplicates,
+            "digest_mismatches": digest_mismatches,
             "exact_once_ok": exact_once_ok,
             "jobs": jobs,
             "events": events,
         }
+
+    @classmethod
+    def _read_snapshot(cls, conn: sqlite3.Connection, request_id: str) -> dict[str, Any]:
+        conn.execute("BEGIN DEFERRED")
+        try:
+            expected = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT request_id, item_id, payload_digest, test_name, failure_kind, created_at
+                    FROM expected_items
+                    WHERE request_id = ?
+                    ORDER BY item_id ASC
+                    """,
+                    (request_id,),
+                ).fetchall()
+            ]
+            jobs = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT request_id, item_id, job_id, payload_digest, created_by_attempt_id, created_at
+                    FROM rerun_jobs
+                    WHERE request_id = ?
+                    ORDER BY item_id ASC
+                    """,
+                    (request_id,),
+                ).fetchall()
+            ]
+            events = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT id, request_id, item_id, attempt_id, session_id, fault_seam, result, job_id, error_code, detail, created_at
+                    FROM attempt_events
+                    WHERE request_id = ?
+                    ORDER BY id ASC
+                    """,
+                    (request_id,),
+                ).fetchall()
+            ]
+        finally:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+        return cls._build_reconcile_summary(request_id, expected, jobs, events)
+
+    def reconcile(self, request_id: str) -> dict[str, Any]:
+        return self._run_with_busy_retry(lambda conn: self._read_snapshot(conn, request_id))
+
+    @classmethod
+    def reconcile_readonly(cls, db_path: Path | str, request_id: str) -> dict[str, Any]:
+        """Take an atomic read-only snapshot without creating tables or altering journal mode."""
+        path = Path(db_path)
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, isolation_level=None)
+        try:
+            conn.row_factory = sqlite3.Row
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            required = {"expected_items", "rerun_jobs", "attempt_events"}
+            if not required.issubset(tables):
+                missing = sorted(required - tables)
+                raise ValueError(f"Queue database {path} is missing required tables: {', '.join(missing)}")
+            return cls._read_snapshot(conn, request_id)
+        finally:
+            conn.close()

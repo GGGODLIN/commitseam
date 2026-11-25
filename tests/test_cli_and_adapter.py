@@ -179,3 +179,95 @@ def test_cli_demo_and_diagnose_reconciliation_offline(tmp_path: Path) -> None:
     full_report = diagnose_run(run_dir)
     assert full_report["mode"] == "OFFLINE_REPLAY"
     assert set(full_report["requests"]) == {"cli-req-deny", "cli-req-pre", "cli-req-post"}
+
+
+def test_review_regressions_receipt_guard_brackets_corrupt_files_and_traces(tmp_path: Path) -> None:
+    import sqlite3
+
+    # 1. --receipt-out pointing at queue.sqlite must be rejected before mutating anything
+    run_dir = tmp_path / "guard-run"
+    proc = subprocess.run(
+        [
+            str(CLI_BIN),
+            "demo",
+            "--yes",
+            "--provider",
+            "offline",
+            "--run-dir",
+            str(run_dir),
+            "--receipt-out",
+            str(run_dir / "queue.sqlite"),
+        ],
+        env=_clean_env(),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert proc.returncode == 2
+    assert not (run_dir / "queue.sqlite").exists()
+
+    # 2. Parameterized pytest names with brackets survive loopback transport & pass both crash seams
+    param_xml = tmp_path / "param_junit.xml"
+    param_xml.write_text(
+        """<testsuite name="param">
+          <testcase classname="tests.t" name="test_a[x=1]"><failure message="a"/></testcase>
+          <testcase classname="tests.t" name="test_b[val]"><failure message="b"/></testcase>
+          <testcase classname="tests.t" name="test_c[val]"><error message="c"/></testcase>
+        </testsuite>""",
+        encoding="utf-8",
+    )
+    param_dir = tmp_path / "param-run"
+    receipt = run_demo(
+        run_dir=param_dir,
+        fixture_path=param_xml,
+        request_id="param-req",
+        provider_settings=ProviderSettings(
+            provider="offline",
+            model="offline-deterministic-local",
+            api_key="offline-local-key",
+        ),
+    )
+    assert receipt["scenarios"]["pre_commit_crash"]["committed_enqueue_count"] == 1
+    assert receipt["scenarios"]["post_commit_crash"]["replay_action"] == "reused"
+
+    # 3. Reusing the same request_id on the same run_dir is rejected cleanly (no silent fake pass)
+    dup_proc = subprocess.run(
+        [
+            str(CLI_BIN),
+            "demo",
+            "--yes",
+            "--provider",
+            "offline",
+            "--run-dir",
+            str(param_dir),
+            "--request-id",
+            "param-req",
+        ],
+        env=_clean_env(),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert dup_proc.returncode == 2
+
+    # 4. Seed a real OpenMinion 'context.manifest.created' event and corrupt receipts.json;
+    # diagnose must still succeed on queue.sqlite, count the trace, and reject malformed bundles.
+    with sqlite3.connect(param_dir / "openminion.sqlite") as conn:
+        conn.execute(
+            "INSERT INTO events (session_id, event_type, payload_json, created_at) VALUES (?, ?, '{}', datetime('now'))",
+            ("param-req-post-s1", "context.manifest.created"),
+        )
+        conn.commit()
+    (param_dir / "receipts.json").write_text("{corrupt json", encoding="utf-8")
+    (param_dir / "memory-bundle-param-req-post.json").write_text('{"metadata": null}', encoding="utf-8")
+
+    diag = diagnose_run(param_dir, request_id="param-req-post")
+    assert diag["exact_once_ok"] is True
+    assert diag["context_traces"]["available"] is True
+    assert diag["context_traces"]["trace_count"] == 1
+    assert diag["memory_bundle_verified"] is False
+    assert "receipt_error" in diag

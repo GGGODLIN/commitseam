@@ -41,6 +41,7 @@ SAMPLE_JUNIT_XML = """<?xml version="1.0" encoding="utf-8"?>
 def oracle_check_enqueue_conservation(
     jobs_rows: list[tuple[str, str, str, str]],
     replays: list[tuple[str, str, str, str | None]],
+    initial_job_ids: dict[tuple[str, str], str] | None = None,
 ) -> tuple[bool, str]:
     """Verify exact-once uniqueness per (request_id, item_id) and stable job_id across replays."""
     seen: dict[tuple[str, str], tuple[str, str]] = {}
@@ -48,12 +49,14 @@ def oracle_check_enqueue_conservation(
         key = (req_id, item_id)
         if key in seen:
             return False, f"duplicate row for {key}"
+        if initial_job_ids is not None and key in initial_job_ids and job_id != initial_job_ids[key]:
+            return False, f"stored job_id drifted for {key}: got={job_id}, initial={initial_job_ids[key]}"
         seen[key] = (job_id, digest)
     for req_id, item_id, action, returned_job_id in replays:
         key = (req_id, item_id)
         if key not in seen:
             return False, f"replay missing committed key {key}"
-        expected_job_id = seen[key][0]
+        expected_job_id = initial_job_ids[key] if (initial_job_ids and key in initial_job_ids) else seen[key][0]
         if action != "reused" or returned_job_id != expected_job_id:
             return False, f"replay drift for {key}: action={action}, got={returned_job_id}, want={expected_job_id}"
     return True, "ok"
@@ -324,7 +327,11 @@ def test_p1_idempotent_enqueue_conservation(
                 "SELECT request_id, item_id, job_id, payload_digest FROM rerun_jobs WHERE request_id = ?",
                 (req_id,),
             ).fetchall()
-        ok, msg = oracle_check_enqueue_conservation(rows, replays)
+        ok, msg = oracle_check_enqueue_conservation(
+            rows,
+            replays,
+            initial_job_ids={(req_id, iid): jid for iid, jid in created_jobs.items()},
+        )
         assert ok, msg
         assert len(rows) == len(batch)
 
@@ -501,10 +508,11 @@ def test_oracle_calibration_catches_known_bad_states() -> None:
     )
     assert ok_dup is False
 
-    # 2. Mutated job_id on replay
+    # 2. Mutated job_id on replay (including joint DB + replay drift against initial job_id)
     ok_mut, _ = oracle_check_enqueue_conservation(
-        jobs_rows=[("r1", "i1", "job-1", "d1")],
+        jobs_rows=[("r1", "i1", "job-999", "d1")],
         replays=[("r1", "i1", "reused", "job-999")],
+        initial_job_ids={("r1", "i1"): "job-1"},
     )
     assert ok_mut is False
 
@@ -550,3 +558,35 @@ def test_regression_blind_verifier_counterexamples(tmp_path: Path) -> None:
     )
     assert parse_junit_failures(xml_order_a) == parse_junit_failures(xml_order_b)
 
+
+def test_review_regressions_expected_digest_unknown_req_and_pii(tmp_path: Path) -> None:
+    ledger = QueueLedger(tmp_path / "rev.sqlite")
+    item = FailureItem(
+        item_id="tests.test_a::test_one[alice@example.com]",
+        test_name="test_one[alice@example.com]",
+        classname="tests.test_a",
+        failure_kind="failure",
+        message="boom",
+        payload_digest="aaaa1111bbbb2222",
+    )
+    ledger.register_expected("req-exp", [item])
+
+    # Enqueue with digest mismatching registered expected_items must fail with ERR_PAYLOAD_CONFLICT
+    bad = ledger.enqueue(
+        request_id="req-exp",
+        item_id=item.item_id,
+        payload_digest="cccc3333dddd4444",
+        attempt_id="att-bad",
+    )
+    assert bad.action == "conflict"
+    assert bad.error_code == "ERR_PAYLOAD_CONFLICT"
+    assert ledger.committed_jobs("req-exp") == []
+
+    # Unknown request_id must NOT report exact_once_ok=True
+    unknown = QueueLedger.reconcile_readonly(tmp_path / "rev.sqlite", "req-typo")
+    assert unknown["unknown_request"] is True
+    assert unknown["exact_once_ok"] is False
+
+    # Email PII inside parameterized item_id is redacted on export
+    _, exported = export_memory_bundle(ledger, request_id="req-exp", mode="OFFLINE_REPLAY")
+    assert not ("alice@example.com" in exported), "email PII leaked into MemoryBundle export"

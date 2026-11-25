@@ -67,7 +67,12 @@ def demo(
 ) -> None:
     """Run approval denial, pre-commit crash (0->1), and post-commit crash (1->1) on sample_junit.xml."""
     resolved_fixture = fixture if fixture is not None else default_fixture_path()
-    items = parse_junit_failures(resolved_fixture)
+    try:
+        items = parse_junit_failures(resolved_fixture)
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        typer.echo(f"Fixture error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
     queue_path = run_dir / "queue.sqlite"
 
     if not yes:
@@ -94,17 +99,17 @@ def demo(
             model=model,
             base_url=base_url,
         )
-    except MissingCredentialsError as exc:
-        typer.echo(f"Credential error: {exc}", err=True)
+        receipt = run_demo(
+            run_dir=run_dir,
+            fixture_path=resolved_fixture,
+            items=items,
+            request_id=request_id,
+            provider_settings=settings,
+            receipt_out=receipt_out,
+        )
+    except (MissingCredentialsError, ValueError, RuntimeError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=2) from exc
-
-    receipt = run_demo(
-        run_dir=run_dir,
-        fixture_path=resolved_fixture,
-        request_id=request_id,
-        provider_settings=settings,
-        receipt_out=receipt_out,
-    )
 
     deny = receipt["scenarios"]["approval_denial"]
     pre = receipt["scenarios"]["pre_commit_crash"]
@@ -149,7 +154,7 @@ def diagnose(
     """Reconcile SQLite queue rows alongside OpenMinion sessions, MemoryBundle, and context_traces."""
     try:
         report = diagnose_run(run_dir, request_id=request_id)
-    except FileNotFoundError as exc:
+    except (FileNotFoundError, ValueError) as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=2) from exc
 

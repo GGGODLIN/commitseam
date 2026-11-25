@@ -36,8 +36,9 @@ from commitseam.ledger import EnqueueResult, FaultMode, InjectedFaultError, Queu
 TOOL_ENQUEUE_RERUN = "enqueue_rerun"
 TOOL_INSPECT_FAILURE = "inspect_failure"
 HANDOFF_TRIAGE = "triage_failure"
+CONTEXT_MANIFEST_EVENT_TYPE = "context.manifest.created"
 
-_ITEM_ID_RE = re.compile(r"item_id=([A-Za-z0-9_.:-]+)")
+_ITEM_ID_RE = re.compile(r"item_id=(\S+)")
 
 
 class MissingCredentialsError(RuntimeError):
@@ -54,6 +55,9 @@ class ProviderSettings:
 
 
 def default_fixture_path() -> Path:
+    packaged = Path(__file__).resolve().parent / "fixtures" / "sample_junit.xml"
+    if packaged.exists():
+        return packaged
     return Path(__file__).resolve().parents[2] / "fixtures" / "sample_junit.xml"
 
 
@@ -311,48 +315,69 @@ def _inspect_openminion_store(om_db_path: Path, session_ids: list[str]) -> dict[
             sessions_found = [str(r[0]) for r in rows]
 
         trace_count = 0
-        if "session_events" in tables and session_ids:
-            placeholders = ",".join("?" for _ in session_ids)
-            row = conn.execute(
-                f"""
-                SELECT COUNT(*)
-                FROM session_events
-                WHERE session_id IN ({placeholders}) AND event_type = 'context_manifest_created'
-                """,
-                session_ids,
-            ).fetchone()
-            trace_count = int(row[0]) if row else 0
-        elif "events" in tables and session_ids:
+        total_events = 0
+        if "events" in tables and session_ids:
             placeholders = ",".join("?" for _ in session_ids)
             cols = {
                 r[1]
                 for r in conn.execute("PRAGMA table_info(events)").fetchall()
             }
             if {"session_id", "event_type"}.issubset(cols):
+                row_total = conn.execute(
+                    f"SELECT COUNT(*) FROM events WHERE session_id IN ({placeholders})",
+                    session_ids,
+                ).fetchone()
+                total_events = int(row_total[0]) if row_total else 0
                 row = conn.execute(
                     f"""
                     SELECT COUNT(*)
                     FROM events
-                    WHERE session_id IN ({placeholders}) AND event_type = 'context_manifest_created'
+                    WHERE session_id IN ({placeholders}) AND event_type = ?
                     """,
-                    session_ids,
+                    (*session_ids, CONTEXT_MANIFEST_EVENT_TYPE),
                 ).fetchone()
                 trace_count = int(row[0]) if row else 0
 
         return {
             "available": trace_count > 0,
-            "reason": "ok" if trace_count > 0 else "no_context_manifest_created_events_recorded",
+            "event_type": CONTEXT_MANIFEST_EVENT_TYPE,
+            "reason": "ok" if trace_count > 0 else "no_context.manifest.created_events_recorded",
             "trace_count": trace_count,
+            "total_events": total_events,
             "sessions_found": sessions_found,
         }
     finally:
         conn.close()
 
 
+def _validate_receipt_out(run_dir: Path, receipt_out: Path | None) -> None:
+    if receipt_out is None:
+        return
+    resolved_out = Path(receipt_out).resolve()
+    resolved_run = run_dir.resolve()
+    reserved = {
+        (resolved_run / "queue.sqlite").resolve(),
+        (resolved_run / "queue.sqlite-wal").resolve(),
+        (resolved_run / "queue.sqlite-shm").resolve(),
+        (resolved_run / "openminion.sqlite").resolve(),
+        (resolved_run / "openminion.sqlite-wal").resolve(),
+        (resolved_run / "openminion.sqlite-shm").resolve(),
+    }
+    if resolved_out in reserved:
+        raise ValueError(f"--receipt-out cannot overwrite internal database file: {resolved_out}")
+    for sub in ("om_home", "om_data"):
+        sub_path = (resolved_run / sub).resolve()
+        if resolved_out == sub_path or sub_path in resolved_out.parents:
+            raise ValueError(f"--receipt-out cannot write inside OpenMinion runtime dir: {resolved_out}")
+    if resolved_out.parent == resolved_run and resolved_out.name.startswith("memory-bundle-"):
+        raise ValueError(f"--receipt-out cannot overwrite memory bundle artifact: {resolved_out}")
+
+
 def run_demo(
     *,
     run_dir: Path,
     fixture_path: Path | None = None,
+    items: list[FailureItem] | None = None,
     request_id: str = "demo-run",
     provider_settings: ProviderSettings | None = None,
     approve_callback: Callable[[str, list[str], Path], bool] | None = None,
@@ -362,24 +387,33 @@ def run_demo(
     """Execute the 3 CommitSeam scenarios through real OpenMinion 0.1.24 + isolated SQLite queue."""
     logging.getLogger("openminion").setLevel(logging.WARNING)
     run_dir = Path(run_dir)
-    run_dir.mkdir(parents=True, exist_ok=True)
+    _validate_receipt_out(run_dir, receipt_out)
 
     settings = provider_settings or resolve_provider_settings()
     mode = "OFFLINE_REPLAY" if settings.provider == "offline" else "LIVE"
     resolved_fixture = Path(fixture_path) if fixture_path is not None else default_fixture_path()
-    items = parse_junit_failures(resolved_fixture)
-    if len(items) < 3:
+    parsed_items = list(items) if items is not None else parse_junit_failures(resolved_fixture)
+    if len(parsed_items) < 3:
         raise ValueError(f"Fixture {resolved_fixture} must contain at least 3 failing testcases")
 
+    run_dir.mkdir(parents=True, exist_ok=True)
     queue_db = run_dir / "queue.sqlite"
     om_db = run_dir / "openminion.sqlite"
     ledger = QueueLedger(queue_db)
+
+    for suffix in ("deny", "pre", "post"):
+        candidate_req = f"{request_id}-{suffix}"
+        if ledger.committed_jobs(candidate_req) or ledger.attempt_events(candidate_req):
+            raise ValueError(
+                f"request_id '{request_id}' already exists in {queue_db}; "
+                "use a fresh --request-id or a clean --run-dir to exercise crash seams cleanly."
+            )
 
     # Confirm operator approval up front if a custom callback was supplied.
     operator_approved = True
     if approve_callback is not None:
         operator_approved = bool(
-            approve_callback(request_id, [it.item_id for it in items], queue_db)
+            approve_callback(request_id, [it.item_id for it in parsed_items], queue_db)
         )
 
     loopback: _OfflineLoopbackServer | None = None
@@ -403,7 +437,7 @@ def run_demo(
             data_root=run_dir / "om_data",
         )
 
-        items_by_id: dict[str, FailureItem] = {it.item_id: it for it in items}
+        items_by_id: dict[str, FailureItem] = {it.item_id: it for it in parsed_items}
 
         # Mutable per-attempt context consumed by the coordinator tool closure.
         ctx: dict[str, Any] = {
@@ -502,14 +536,16 @@ def run_demo(
             session_id: str,
             fault_seam: FaultMode,
             allow_write: bool,
+            budget: list[int],
         ) -> dict[str, Any]:
             approval_calls: list[dict[str, Any]] = []
             cancel_ev = threading.Event()
+            active_session_id = session_id
             ctx.update(
                 {
                     "request_id": req_id,
                     "attempt_id": attempt_id,
-                    "session_id": session_id,
+                    "session_id": active_session_id,
                     "fault_seam": fault_seam,
                     "cancel_event": cancel_ev,
                     "last_result": None,
@@ -540,7 +576,7 @@ def run_demo(
                         request_id=req_id,
                         item_id=item.item_id,
                         attempt_id=attempt_id,
-                        session_id=session_id,
+                        session_id=ctx["session_id"],
                         detail=f"approval_callback_denied:{approval_id}",
                     )
                 return approved
@@ -552,12 +588,17 @@ def run_demo(
             stats: dict[str, Any] = {}
             sdk_error: str | None = None
             reply_text = ""
+            retry_idx = 0
 
-            for retry_idx in range(max_attempts):
+            while budget[0] > 0:
+                budget[0] -= 1
+                active_session_id = session_id if retry_idx == 0 else f"{session_id}-rl{retry_idx}"
+                ctx["session_id"] = active_session_id
+                retry_idx += 1
                 try:
                     res = coord_agent.run(
                         prompt,
-                        session_id=session_id if retry_idx == 0 else f"{session_id}-rl{retry_idx}",
+                        session_id=active_session_id,
                         approval_callback=decide,
                         cancel_event=cancel_ev,
                         timeout_seconds=float(settings.timeout_seconds),
@@ -567,12 +608,9 @@ def run_demo(
                     break
                 except (ProviderError, TurnTimeoutError) as exc:
                     sdk_error = f"{type(exc).__name__}: {exc}"
-                    # If the tool already fired an injected fault OR already committed before
-                    # a real provider error (e.g. Groq TPM post-tool rate limit), stop retrying
-                    # this attempt and let outer SQLite reconciliation handle recovery!
                     if ctx["last_fault"] is not None or ctx["last_result"] is not None:
                         break
-                    if "RATE_LIMITED" in str(exc) and retry_idx + 1 < max_attempts:
+                    if "RATE_LIMITED" in str(exc) and budget[0] > 0:
                         time.sleep(25.0)
                         continue
                     raise
@@ -589,7 +627,7 @@ def run_demo(
             last_result: EnqueueResult | None = ctx["last_result"]
             return {
                 "attempt_id": attempt_id,
-                "session_id": session_id,
+                "session_id": active_session_id,
                 "fault_seam": fault_seam.value,
                 "approval_calls": approval_calls,
                 "injected_fault": last_fault.seam.value if last_fault is not None else None,
@@ -616,7 +654,7 @@ def run_demo(
         # Scenario 1: Approval Denial (0 rows added to rerun_jobs)
         # ------------------------------------------------------------------
         deny_req = f"{request_id}-deny"
-        deny_item = items[0]
+        deny_item = parsed_items[0]
         ledger.register_expected(deny_req, [deny_item])
         deny_att = _invoke_attempt(
             req_id=deny_req,
@@ -625,6 +663,7 @@ def run_demo(
             session_id=f"{deny_req}-s1",
             fault_seam=FaultMode.NONE,
             allow_write=False,
+            budget=[max(1, max_attempts)],
         )
         deny_rec = ledger.reconcile(deny_req)
         _, deny_bundle_json = export_memory_bundle(
@@ -636,8 +675,9 @@ def run_demo(
         # Scenario 2: Seam B — Pre-Commit Crash (0 -> 1 across fresh session_id)
         # ------------------------------------------------------------------
         pre_req = f"{request_id}-pre"
-        pre_item = items[1]
+        pre_item = parsed_items[1]
         ledger.register_expected(pre_req, [pre_item])
+        pre_budget = [max(2, max_attempts)]
         pre_att1 = _invoke_attempt(
             req_id=pre_req,
             item=pre_item,
@@ -645,11 +685,12 @@ def run_demo(
             session_id=f"{pre_req}-s1",
             fault_seam=FaultMode.PRE_COMMIT,
             allow_write=True,
+            budget=pre_budget,
         )
         pre_after_crash = len(ledger.committed_jobs(pre_req))
         pending_pre = ledger.pending_items(pre_req)
         pre_attempts = [pre_att1]
-        if pending_pre and operator_approved:
+        if pending_pre and operator_approved and pre_budget[0] > 0:
             pre_att2 = _invoke_attempt(
                 req_id=pre_req,
                 item=items_by_id[pending_pre[0]["item_id"]],
@@ -657,6 +698,7 @@ def run_demo(
                 session_id=f"{pre_req}-s2",
                 fault_seam=FaultMode.NONE,
                 allow_write=True,
+                budget=pre_budget,
             )
             pre_attempts.append(pre_att2)
         pre_rec = ledger.reconcile(pre_req)
@@ -669,8 +711,9 @@ def run_demo(
         # Scenario 3: Seam A — Post-Commit Crash (1 -> 1 identical job_id)
         # ------------------------------------------------------------------
         post_req = f"{request_id}-post"
-        post_item = items[2]
+        post_item = parsed_items[2]
         ledger.register_expected(post_req, [post_item])
+        post_budget = [max(2, max_attempts)]
         post_att1 = _invoke_attempt(
             req_id=post_req,
             item=post_item,
@@ -678,6 +721,7 @@ def run_demo(
             session_id=f"{post_req}-s1",
             fault_seam=FaultMode.POST_COMMIT,
             allow_write=True,
+            budget=post_budget,
         )
         post_after_crash_jobs = ledger.committed_jobs(post_req)
         post_after_crash = len(post_after_crash_jobs)
@@ -686,7 +730,7 @@ def run_demo(
             post_after_crash_jobs[0]["created_by_attempt_id"] if post_after_crash_jobs else None
         )
         post_attempts = [post_att1]
-        if operator_approved:
+        if operator_approved and post_budget[0] > 0:
             # Retry on a fresh SDK session_id under the same business request_id;
             # ledger must return action="reused" and identical recovered_job_id.
             post_att2 = _invoke_attempt(
@@ -696,6 +740,7 @@ def run_demo(
                 session_id=f"{post_req}-s2",
                 fault_seam=FaultMode.NONE,
                 allow_write=True,
+                budget=post_budget,
             )
             post_attempts.append(post_att2)
         post_rec = ledger.reconcile(post_req)
@@ -719,6 +764,25 @@ def run_demo(
 
     elapsed_ms = int((time.monotonic() - t0) * 1000)
     post_replay = post_attempts[-1]["tool_result"] if len(post_attempts) > 1 else None
+
+    if operator_approved:
+        if pre_att1["injected_fault"] != FaultMode.PRE_COMMIT.value or pre_after_crash != 0 or not pre_rec["exact_once_ok"]:
+            raise RuntimeError(
+                f"Pre-commit seam verification failed: injected={pre_att1['injected_fault']} "
+                f"after_crash={pre_after_crash} final={pre_rec['committed_enqueue_count']}"
+            )
+        if (
+            post_att1["injected_fault"] != FaultMode.POST_COMMIT.value
+            or post_after_crash != 1
+            or not post_rec["exact_once_ok"]
+            or post_replay is None
+            or post_replay["action"] != "reused"
+            or post_replay["recovered_job_id"] != initial_job_id
+        ):
+            raise RuntimeError(
+                f"Post-commit seam verification failed: injected={post_att1['injected_fault']} "
+                f"after_crash={post_after_crash} replay={post_replay}"
+            )
 
     receipt: dict[str, Any] = redact_secrets(
         {
@@ -809,41 +873,64 @@ def diagnose_run(
         raise FileNotFoundError(f"Queue database not found: {queue_db}")
 
     saved_receipt: dict[str, Any] = {}
+    receipt_error: str | None = None
     if receipt_path.exists():
-        saved_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        try:
+            loaded = json.loads(receipt_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                saved_receipt = loaded
+            else:
+                receipt_error = "receipts.json root is not a JSON object"
+        except (OSError, json.JSONDecodeError) as exc:
+            receipt_error = f"receipts.json parse error: {exc}"
 
-    mode = str(saved_receipt.get("mode", "OFFLINE_REPLAY"))
-    ledger = QueueLedger(queue_db)
+    mode = str(saved_receipt.get("mode", "UNKNOWN" if receipt_error else "OFFLINE_REPLAY"))
+
+    def _verify_bundle(req_id: str, expected_job_ids: set[str]) -> tuple[bool, str | None]:
+        bundle_path = run_dir / f"memory-bundle-{req_id}.json"
+        if not bundle_path.exists():
+            return False, "memory_bundle_missing"
+        try:
+            parsed = json.loads(bundle_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            return False, f"memory_bundle_corrupt: {exc}"
+        if not isinstance(parsed, dict):
+            return False, "memory_bundle_not_object"
+        meta = parsed.get("metadata")
+        bundle_items = parsed.get("items")
+        if not isinstance(meta, dict) or not isinstance(bundle_items, list):
+            return False, "memory_bundle_missing_metadata_or_items"
+        if meta.get("request_id") != req_id:
+            return False, "memory_bundle_request_id_mismatch"
+        bundle_job_ids = {
+            str(it.get("job_id"))
+            for it in bundle_items
+            if isinstance(it, dict) and it.get("kind") == "rerun_job" and it.get("job_id")
+        }
+        if bundle_job_ids != expected_job_ids:
+            return False, "memory_bundle_job_ids_mismatch"
+        return True, None
 
     def _build_single(req_id: str) -> dict[str, Any]:
-        rec = ledger.reconcile(req_id)
+        rec = QueueLedger.reconcile_readonly(queue_db, req_id)
         session_ids = sorted(
             {str(ev["session_id"]) for ev in rec["events"] if ev.get("session_id")}
         )
         reused_events = [ev for ev in rec["events"] if ev.get("result") == "reused"]
         recovered_job_id = reused_events[-1]["job_id"] if reused_events else None
         last_action = rec["events"][-1]["result"] if rec["events"] else None
-
-        bundle_path = run_dir / f"memory-bundle-{req_id}.json"
-        bundle_verified = False
-        if bundle_path.exists():
-            try:
-                parsed_bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
-                bundle_verified = (
-                    isinstance(parsed_bundle, dict)
-                    and parsed_bundle.get("metadata", {}).get("request_id") == req_id
-                )
-            except json.JSONDecodeError:
-                bundle_verified = False
-
+        expected_job_ids = {str(j["job_id"]) for j in rec["jobs"]}
+        bundle_verified, bundle_error = _verify_bundle(req_id, expected_job_ids)
         traces = _inspect_openminion_store(om_db, session_ids)
-        return {
+        result: dict[str, Any] = {
             "mode": mode,
             "request_id": req_id,
+            "unknown_request": rec["unknown_request"],
             "expected_count": rec["expected_count"],
             "committed_enqueue_count": rec["committed_enqueue_count"],
             "pending_item_ids": rec["pending_item_ids"],
             "has_duplicates": rec["has_duplicates"],
+            "digest_mismatches": rec["digest_mismatches"],
             "exact_once_ok": rec["exact_once_ok"],
             "action": last_action,
             "recovered_job_id": recovered_job_id,
@@ -852,7 +939,11 @@ def diagnose_run(
             "session_ids": session_ids,
             "context_traces": traces,
             "memory_bundle_verified": bundle_verified,
+            "memory_bundle_error": bundle_error,
         }
+        if receipt_error is not None:
+            result["receipt_error"] = receipt_error
+        return result
 
     if request_id is not None:
         return redact_secrets(_build_single(request_id))
@@ -866,11 +957,12 @@ def diagnose_run(
     finally:
         conn.close()
 
-    return redact_secrets(
-        {
-            "mode": mode,
-            "model": saved_receipt.get("model"),
-            "provider": saved_receipt.get("provider"),
-            "requests": {rid: _build_single(rid) for rid in req_ids},
-        }
-    )
+    summary: dict[str, Any] = {
+        "mode": mode,
+        "model": saved_receipt.get("model"),
+        "provider": saved_receipt.get("provider"),
+        "requests": {rid: _build_single(rid) for rid in req_ids},
+    }
+    if receipt_error is not None:
+        summary["receipt_error"] = receipt_error
+    return redact_secrets(summary)

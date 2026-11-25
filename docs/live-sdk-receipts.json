@@ -2,7 +2,8 @@
   "base_request_id": "live-v1",
   "context_traces": {
     "available": false,
-    "reason": "no_context_manifest_created_events_recorded",
+    "event_type": "context.manifest.created",
+    "reason": "no_context.manifest.created_events_recorded",
     "sessions_found": [
       "live-v1-deny-s1",
       "live-v1-post-s1",
@@ -10,6 +11,7 @@
       "live-v1-pre-s1",
       "live-v1-pre-s2"
     ],
+    "total_events": 52,
     "trace_count": 0
   },
   "elapsed_ms": 179088,

@@ -27,6 +27,9 @@ commitseam = "commitseam.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+commitseam = ["fixtures/*.xml"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
