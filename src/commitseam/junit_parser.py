@@ -17,10 +17,6 @@ class FailureItem:
     payload_digest: str
 
 
-def _normalize_text(value: str | None) -> str:
-    return " ".join((value or "").split())
-
-
 def _build_digest(
     *,
     item_id: str,
@@ -80,8 +76,8 @@ def parse_junit_failures(xml_source: str | Path) -> list[FailureItem]:
                 continue
 
             item_id = f"{classname}::{test_name}" if classname else test_name
-            msg_attr = _normalize_text(chosen.attrib.get("message"))
-            body_text = _normalize_text(chosen.text)
+            msg_attr = (chosen.attrib.get("message") or "").strip()
+            body_text = (chosen.text or "").strip()
             message = msg_attr or body_text or failure_kind
             digest = _build_digest(
                 item_id=item_id,

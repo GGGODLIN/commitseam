@@ -4,7 +4,6 @@ import sqlite3
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Literal, Sequence, TypeVar
@@ -20,7 +19,7 @@ CREATE TABLE IF NOT EXISTS expected_items (
     payload_digest TEXT NOT NULL,
     test_name TEXT NOT NULL,
     failure_kind TEXT NOT NULL,
-    created_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (request_id, item_id)
 );
 
@@ -30,7 +29,7 @@ CREATE TABLE IF NOT EXISTS rerun_jobs (
     job_id TEXT NOT NULL,
     payload_digest TEXT NOT NULL,
     created_by_attempt_id TEXT NOT NULL,
-    created_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE (request_id, item_id)
 );
 
@@ -45,13 +44,9 @@ CREATE TABLE IF NOT EXISTS attempt_events (
     job_id TEXT,
     error_code TEXT,
     detail TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 """
-
-
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 class FaultMode(str, Enum):
@@ -156,8 +151,6 @@ class QueueLedger:
         self._run_with_busy_retry(_op)
 
     def register_expected(self, request_id: str, items: Sequence[FailureItem]) -> int:
-        now = _utc_now()
-
         def _op(conn: sqlite3.Connection) -> int:
             conn.execute("BEGIN IMMEDIATE")
             try:
@@ -166,8 +159,8 @@ class QueueLedger:
                     cur = conn.execute(
                         """
                         INSERT OR IGNORE INTO expected_items
-                            (request_id, item_id, payload_digest, test_name, failure_kind, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?)
+                            (request_id, item_id, payload_digest, test_name, failure_kind)
+                        VALUES (?, ?, ?, ?, ?)
                         """,
                         (
                             request_id,
@@ -175,7 +168,6 @@ class QueueLedger:
                             item.payload_digest,
                             item.test_name,
                             item.failure_kind,
-                            now,
                         ),
                     )
                     if cur.rowcount > 0:
@@ -244,16 +236,14 @@ class QueueLedger:
         session_id: str | None = None,
         detail: str = "approval_denied",
     ) -> EnqueueResult:
-        now = _utc_now()
-
         def _op(conn: sqlite3.Connection) -> EnqueueResult:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 conn.execute(
                     """
                     INSERT INTO attempt_events
-                        (request_id, item_id, attempt_id, session_id, fault_seam, result, job_id, error_code, detail, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+                        (request_id, item_id, attempt_id, session_id, fault_seam, result, job_id, error_code, detail)
+                    VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?)
                     """,
                     (
                         request_id,
@@ -263,7 +253,6 @@ class QueueLedger:
                         FaultMode.NONE.value,
                         "denied",
                         detail,
-                        now,
                     ),
                 )
                 conn.execute("COMMIT")
@@ -292,7 +281,6 @@ class QueueLedger:
         fault_seam: FaultMode | str = FaultMode.NONE,
     ) -> EnqueueResult:
         seam = FaultMode.coerce(fault_seam)
-        now = _utc_now()
 
         def _op(conn: sqlite3.Connection) -> tuple[EnqueueResult | None, InjectedFaultError | None]:
             conn.execute("BEGIN IMMEDIATE")
@@ -314,10 +302,10 @@ class QueueLedger:
                         conn.execute(
                             """
                             INSERT INTO attempt_events
-                                (request_id, item_id, attempt_id, session_id, fault_seam, result, job_id, error_code, detail, created_at)
-                            VALUES (?, ?, ?, ?, ?, 'reused', ?, NULL, 'idempotent_replay', ?)
+                                (request_id, item_id, attempt_id, session_id, fault_seam, result, job_id, error_code, detail)
+                            VALUES (?, ?, ?, ?, ?, 'reused', ?, NULL, 'idempotent_replay')
                             """,
-                            (request_id, item_id, attempt_id, session_id, seam.value, existing_job_id, now),
+                            (request_id, item_id, attempt_id, session_id, seam.value, existing_job_id),
                         )
                         conn.execute("COMMIT")
                         return (
@@ -335,10 +323,10 @@ class QueueLedger:
                     conn.execute(
                         """
                         INSERT INTO attempt_events
-                            (request_id, item_id, attempt_id, session_id, fault_seam, result, job_id, error_code, detail, created_at)
-                        VALUES (?, ?, ?, ?, ?, 'conflict', ?, 'ERR_PAYLOAD_CONFLICT', 'payload_digest_mismatch', ?)
+                            (request_id, item_id, attempt_id, session_id, fault_seam, result, job_id, error_code, detail)
+                        VALUES (?, ?, ?, ?, ?, 'conflict', ?, 'ERR_PAYLOAD_CONFLICT', 'payload_digest_mismatch')
                         """,
-                        (request_id, item_id, attempt_id, session_id, seam.value, existing_job_id, now),
+                        (request_id, item_id, attempt_id, session_id, seam.value, existing_job_id),
                     )
                     conn.execute("COMMIT")
                     return (
@@ -358,10 +346,10 @@ class QueueLedger:
                 conn.execute(
                     """
                     INSERT INTO rerun_jobs
-                        (request_id, item_id, job_id, payload_digest, created_by_attempt_id, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                        (request_id, item_id, job_id, payload_digest, created_by_attempt_id)
+                    VALUES (?, ?, ?, ?, ?)
                     """,
-                    (request_id, item_id, job_id, payload_digest, attempt_id, now),
+                    (request_id, item_id, job_id, payload_digest, attempt_id),
                 )
 
                 if seam == FaultMode.PRE_COMMIT:
@@ -372,10 +360,10 @@ class QueueLedger:
                     conn.execute(
                         """
                         INSERT INTO attempt_events
-                            (request_id, item_id, attempt_id, session_id, fault_seam, result, job_id, error_code, detail, created_at)
-                        VALUES (?, ?, ?, ?, ?, 'pre_commit_abort', NULL, 'INJECTED_PRE_COMMIT', 'aborted_before_commit', ?)
+                            (request_id, item_id, attempt_id, session_id, fault_seam, result, job_id, error_code, detail)
+                        VALUES (?, ?, ?, ?, ?, 'pre_commit_abort', NULL, 'INJECTED_PRE_COMMIT', 'aborted_before_commit')
                         """,
-                        (request_id, item_id, attempt_id, session_id, seam.value, now),
+                        (request_id, item_id, attempt_id, session_id, seam.value),
                     )
                     conn.execute("COMMIT")
                     return (
@@ -395,10 +383,10 @@ class QueueLedger:
                 conn.execute(
                     """
                     INSERT INTO attempt_events
-                        (request_id, item_id, attempt_id, session_id, fault_seam, result, job_id, error_code, detail, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        (request_id, item_id, attempt_id, session_id, fault_seam, result, job_id, error_code, detail)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (request_id, item_id, attempt_id, session_id, seam.value, event_result, job_id, event_error, event_detail, now),
+                    (request_id, item_id, attempt_id, session_id, seam.value, event_result, job_id, event_error, event_detail),
                 )
                 conn.execute("COMMIT")
 

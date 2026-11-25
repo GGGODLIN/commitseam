@@ -20,14 +20,8 @@ dev = [
   "hypothesis>=6.100",
 ]
 
-[project.scripts]
-commitseam = "commitseam.cli:main"
-
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = [
-  "live: tests that call a real LLM endpoint via OpenMinion 0.1.24",
-]
