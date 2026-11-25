@@ -252,6 +252,8 @@ def test_denial_non_mutation_and_memory_bundle_export_redaction(tmp_path: Path) 
 
     # Export MemoryBundle with synthetic secret markers in metadata; must be read-only & redacted
     fake_secret = "FAKE_SECRET_TOKEN_999"
+    fake_api_key = "sk" + "-live-synthetic-1234567890"
+    fake_home = "/" + "Users" + "/demo_operator"
     pending_before = ledger.pending_items("req-deny")
     bundle, serialized = export_memory_bundle(
         ledger,
@@ -259,14 +261,14 @@ def test_denial_non_mutation_and_memory_bundle_export_redaction(tmp_path: Path) 
         mode="OFFLINE_REPLAY",
         metadata={
             "note": f"authorization Bearer {fake_secret}",
-            "api_key": "sk-live-synthetic-1234567890",
-            "local_path": "/Users/demo_operator/Desktop/secret.xml",
+            "api_key": fake_api_key,
+            "local_path": f"{fake_home}/Desktop/secret.xml",
         },
     )
     assert ledger.pending_items("req-deny") == pending_before
     assert not (fake_secret in serialized), "synthetic fake secret leaked into MemoryBundle JSON"
-    assert not ("sk-live-synthetic-1234567890" in serialized), "synthetic sk key leaked into MemoryBundle JSON"
-    assert not ("/Users/demo_operator" in serialized), "synthetic local home path leaked into MemoryBundle JSON"
+    assert not (fake_api_key in serialized), "synthetic sk key leaked into MemoryBundle JSON"
+    assert not (fake_home in serialized), "synthetic local home path leaked into MemoryBundle JSON"
     parsed = json.loads(serialized)
     assert parsed["metadata"]["mode"] == "OFFLINE_REPLAY"
     assert bundle.to_json() == serialized
@@ -520,8 +522,10 @@ def test_oracle_calibration_catches_known_bad_states() -> None:
     assert ok_leak is False
 
     # 5. Redactor actually transforms a seeded synthetic secret (positive control against vacuous pass)
-    redacted = redact_secrets({"auth": "Bearer FAKE_SECRET_TOKEN_999"})
-    assert not ("FAKE_SECRET_TOKEN_999" in json.dumps(redacted)), "redactor failed positive control"
+    redacted = redact_secrets({"auth": "Bearer FAKE_SECRET_TOKEN_999", "err": "org_01syntheticorg123456"})
+    redacted_json = json.dumps(redacted)
+    assert not ("FAKE_SECRET_TOKEN_999" in redacted_json), "redactor failed positive control"
+    assert not ("org_01syntheticorg123456" in redacted_json), "redactor failed org ID positive control"
 
 
 def test_regression_blind_verifier_counterexamples(tmp_path: Path) -> None:

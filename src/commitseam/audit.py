@@ -11,6 +11,7 @@ _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._\-]+"),
     re.compile(r"\bFAKE_SECRET_[A-Za-z0-9_\-]+\b"),
     re.compile(r"\b(?:sk|gsk|ghp|gho|xoxb|AIza)[A-Za-z0-9_\-]{8,}\b"),
+    re.compile(r"\borg_[A-Za-z0-9]{10,}\b"),
     re.compile(r"(?i)(?:api[_-]?key|token|secret|password)\s*[=:]\s*['\"]?[^\s'\",;]+"),
     re.compile(r"/(?:Users|home)/[^/\s\"']+"),
 )
