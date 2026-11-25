@@ -38,7 +38,6 @@ TOOL_INSPECT_FAILURE = "inspect_failure"
 HANDOFF_TRIAGE = "triage_failure"
 
 _ITEM_ID_RE = re.compile(r"item_id=([A-Za-z0-9_.:-]+)")
-_RETRY_AFTER_RE = re.compile(r"try again in\s+([0-9]+(?:\.[0-9]+)?)s", re.IGNORECASE)
 
 
 class MissingCredentialsError(RuntimeError):
@@ -350,20 +349,6 @@ def _inspect_openminion_store(om_db_path: Path, session_ids: list[str]) -> dict[
         conn.close()
 
 
-def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(tmp_path, path)
-
-
-def _extract_retry_sleep(exc: Exception) -> float:
-    match = _RETRY_AFTER_RE.search(str(exc))
-    if match:
-        return min(float(match.group(1)) + 1.5, 45.0)
-    return 15.0
-
-
 def run_demo(
     *,
     run_dir: Path,
@@ -588,7 +573,7 @@ def run_demo(
                     if ctx["last_fault"] is not None or ctx["last_result"] is not None:
                         break
                     if "RATE_LIMITED" in str(exc) and retry_idx + 1 < max_attempts:
-                        time.sleep(_extract_retry_sleep(exc))
+                        time.sleep(25.0)
                         continue
                     raise
                 except AgentOutputValidationError as exc:
@@ -797,9 +782,15 @@ def run_demo(
         }
     )
 
-    _atomic_write_json(run_dir / "receipts.json", receipt)
-    if receipt_out is not None:
-        _atomic_write_json(Path(receipt_out), receipt)
+    encoded_receipt = json.dumps(receipt, indent=2, sort_keys=True) + "\n"
+    for target in (run_dir / "receipts.json", receipt_out):
+        if target is None:
+            continue
+        target_path = Path(target)
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = target_path.with_suffix(target_path.suffix + ".tmp")
+        tmp_path.write_text(encoded_receipt, encoding="utf-8")
+        os.replace(tmp_path, target_path)
     return receipt
 
 

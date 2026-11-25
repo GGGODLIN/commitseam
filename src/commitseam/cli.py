@@ -159,10 +159,14 @@ def diagnose(
 
     typer.echo(f"MODE: {report['mode']}")
     if request_id is not None:
+        job_ids = [j["job_id"] for j in report["jobs"]]
+        creators = [j["created_by_attempt_id"] for j in report["jobs"]]
         typer.echo(
             f"request_id={report['request_id']} expected={report['expected_count']} "
             f"committed={report['committed_enqueue_count']} exact_once={report['exact_once_ok']} "
+            f"job_id={','.join(job_ids) or 'none'} created_by_attempt_id={','.join(creators) or 'none'} "
             f"action={report['action']} recovered_job_id={report['recovered_job_id']} "
+            f"session_ids={','.join(report['session_ids']) or 'none'} "
             f"memory_bundle_verified={report['memory_bundle_verified']} "
             f"context_traces={report['context_traces']['available']} ({report['context_traces']['trace_count']})"
         )
