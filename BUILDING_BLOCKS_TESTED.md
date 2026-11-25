@@ -24,33 +24,114 @@ All observations below were verified first-hand against pinned **`openminion==0.
 
 ## Reproducible Verification Commands
 
-Every finding above can be reproduced directly in this repository:
+Every finding above can be reproduced directly in this repository (`0` external credentials required for commands 1–5):
 
 ```bash
-# 1. Run full offline suite (16 tests + 500 Hypothesis P1..P5 cases + real OpenMinion 0.1.24 loopback)
+# 1. Run full offline suite (18 tests + 500 Hypothesis P1..P5 cases + real OpenMinion 0.1.24 loopback)
 .venv/bin/pytest -v
 
-# 2. Reproduce @tool(min_scope="WRITE") late KeyError vs valid "WRITE_SAFE"
+# 2. Reproduce @tool(min_scope="WRITE") passing decoration silently, then failing at runtime
 .venv/bin/python -c '
-from openminion import tool
-@tool(min_scope="WRITE")
-def bad_scope(x: str) -> str:
-    return x
-print("Decoration succeeded silently despite invalid min_scope=WRITE")
+import tempfile
+from pathlib import Path
+from openminion import APIRuntime, Agent, OpenMinionConfig, tool
+from openminion.base.config.core import ActionPolicyConfig, AgentProfileConfig, StorageConfig
+from openminion.base.config.providers import OpenAIProviderConfig, ProvidersConfig
+from commitseam.minion_adapter import _OfflineLoopbackServer
+
+@tool(min_scope="WRITE", dangerous=True)
+def bad_scope(item_id: str) -> str:
+    return item_id
+
+srv = _OfflineLoopbackServer(); srv.start()
+with tempfile.TemporaryDirectory() as d:
+    p = Path(d)
+    cfg = OpenMinionConfig(
+        storage=StorageConfig(path=str(p / "om.sqlite")),
+        providers=ProvidersConfig(openai=OpenAIProviderConfig(api_key="k", base_url=srv.base_url, model="m", tool_call_strategy="native")),
+        action_policy=ActionPolicyConfig(mode="confirm", allow_read_only_without_prompt=True),
+        agents={"coord": AgentProfileConfig(name="coord", provider="openai", default_channel="console")},
+        default_agent="coord",
+    )
+    rt = APIRuntime.from_config(config=cfg, home_root=p / "h", data_root=p / "d")
+    try:
+        with Agent(runtime=rt, agent_id="coord", tools=[bad_scope], forced_tools=["bad_scope"]) as ag:
+            res = ag.run("Call bad_scope item_id=x", session_id="s1", approval_callback=lambda *_: True)
+            print("RUNTIME_REPLY:", res.text)
+    except Exception as exc:
+        print("RUNTIME_ERROR:", type(exc).__name__, exc)
+    finally:
+        rt.close(); srv.close()
 '
 
-# 3. Reproduce APIRuntime.from_config missing default_channel="console" denial
+# 3. Reproduce APIRuntime.from_config failing with invalid_channel when default_channel is omitted
 .venv/bin/python -c '
-from openminion.base.config.core import AgentProfileConfig
-cfg = AgentProfileConfig(name="coord", provider="openai")
-print("AgentProfileConfig.default_channel default =", repr(cfg.default_channel))
+import tempfile
+from pathlib import Path
+from openminion import APIRuntime, Agent, OpenMinionConfig
+from openminion.base.config.core import AgentProfileConfig, StorageConfig
+from openminion.base.config.providers import OpenAIProviderConfig, ProvidersConfig
+
+with tempfile.TemporaryDirectory() as d:
+    p = Path(d)
+    cfg = OpenMinionConfig(
+        storage=StorageConfig(path=str(p / "om.sqlite")),
+        providers=ProvidersConfig(openai=OpenAIProviderConfig(api_key="k", base_url="http://127.0.0.1:9/v1", model="m")),
+        agents={"coord": AgentProfileConfig(name="coord", provider="openai")},
+        default_agent="coord",
+    )
+    rt = APIRuntime.from_config(config=cfg, home_root=p / "h", data_root=p / "d")
+    try:
+        with Agent(runtime=rt, agent_id="coord") as ag:
+            ag.run("hello", session_id="s1")
+    except RuntimeError as exc:
+        print("REPRODUCED:", exc)
+    finally:
+        rt.close()
 '
 
-# 4. Run full offline CLI demo + diagnose reconciliation (0 credentials required)
+# 4. Reproduce approval denial crashing Agent(..., output_type=BaseModel) with AgentOutputValidationError
+.venv/bin/python -c '
+import tempfile
+from pathlib import Path
+from pydantic import BaseModel
+from openminion import APIRuntime, Agent, AgentOutputValidationError, OpenMinionConfig, tool
+from openminion.base.config.core import ActionPolicyConfig, AgentProfileConfig, StorageConfig
+from openminion.base.config.providers import OpenAIProviderConfig, ProvidersConfig
+from commitseam.minion_adapter import _OfflineLoopbackServer
+
+class Out(BaseModel):
+    status: str
+
+@tool(min_scope="WRITE_SAFE", dangerous=True)
+def enqueue_rerun(item_id: str) -> str:
+    return "{\"status\":\"ok\"}"
+
+srv = _OfflineLoopbackServer(); srv.start()
+with tempfile.TemporaryDirectory() as d:
+    p = Path(d)
+    cfg = OpenMinionConfig(
+        storage=StorageConfig(path=str(p / "om.sqlite")),
+        providers=ProvidersConfig(openai=OpenAIProviderConfig(api_key="k", base_url=srv.base_url, model="m", tool_call_strategy="native")),
+        action_policy=ActionPolicyConfig(mode="confirm", allow_read_only_without_prompt=True),
+        agents={"coord": AgentProfileConfig(name="coord", provider="openai", default_channel="console")},
+        default_agent="coord",
+    )
+    rt = APIRuntime.from_config(config=cfg, home_root=p / "h", data_root=p / "d")
+    try:
+        with Agent(runtime=rt, agent_id="coord", tools=[enqueue_rerun], forced_tools=["enqueue_rerun"], output_type=Out) as ag:
+            ag.run("Call enqueue_rerun item_id=x", session_id="s1", approval_callback=lambda *_: False)
+    except AgentOutputValidationError as exc:
+        print("REPRODUCED:", type(exc).__name__, str(exc)[:140])
+    finally:
+        rt.close(); srv.close()
+'
+
+# 5. Run full offline CLI demo + diagnose reconciliation (0 credentials required)
 .venv/bin/commitseam demo --yes --provider offline --run-dir /tmp/cs-offline --request-id demo-1
 .venv/bin/commitseam diagnose --run-dir /tmp/cs-offline --request-id demo-1-post --json
 
-# 5. Run live Groq demo + diagnose (requires GROQ_API_KEY)
+# 6. Run live Groq demo + diagnose (requires GROQ_API_KEY)
 .venv/bin/commitseam demo --yes --provider groq --model openai/gpt-oss-20b --run-dir /tmp/cs-live --request-id live-1
 .venv/bin/commitseam diagnose --run-dir /tmp/cs-live --json
 ```

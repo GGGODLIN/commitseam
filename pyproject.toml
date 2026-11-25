@@ -32,6 +32,3 @@ commitseam = ["fixtures/*.xml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = [
-  "live: tests that call a real LLM endpoint via OpenMinion 0.1.24",
-]

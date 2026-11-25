@@ -74,6 +74,7 @@ def test_adapter_full_offline_flow_handoff_isolation_and_dual_crash_seams(tmp_pa
         run_dir=run_dir,
         fixture_path=default_fixture_path(),
         request_id="req-demo",
+        operator_approved=True,
         provider_settings=ProviderSettings(
             provider="offline",
             model="offline-deterministic-local",
@@ -85,6 +86,22 @@ def test_adapter_full_offline_flow_handoff_isolation_and_dual_crash_seams(tmp_pa
     assert receipt["runtime_closed"] is True
     assert receipt["handoff_peer_read_only"] is True
     assert receipt["handoff_peer_write_tools"] == []
+    assert receipt["triage_peer_invoked"] is True
+
+    # Default operator_approved=False must never write any rows into rerun_jobs
+    unapproved_dir = tmp_path / "unapproved-demo"
+    unapproved = run_demo(
+        run_dir=unapproved_dir,
+        fixture_path=default_fixture_path(),
+        request_id="req-unapproved",
+        provider_settings=ProviderSettings(
+            provider="offline",
+            model="offline-deterministic-local",
+            api_key="offline-local-key",
+        ),
+    )
+    assert unapproved["scenarios"]["pre_commit_crash"]["committed_enqueue_count"] == 0
+    assert unapproved["scenarios"]["post_commit_crash"]["committed_enqueue_count"] == 0
 
     # Separate SQLite files: CommitSeam queue DB vs OpenMinion session store
     queue_db = run_dir / "queue.sqlite"
@@ -208,11 +225,12 @@ def test_review_regressions_receipt_guard_brackets_corrupt_files_and_traces(tmp_
     assert proc.returncode == 2
     assert not (run_dir / "queue.sqlite").exists()
 
-    # 2. Parameterized pytest names with brackets survive loopback transport & pass both crash seams
+    # 2. Parameterized pytest names with brackets & synthetic secret survive loopback & redact on export/diagnose
+    secret_marker = "FAKE_SECRET_TOKEN_999"
     param_xml = tmp_path / "param_junit.xml"
     param_xml.write_text(
-        """<testsuite name="param">
-          <testcase classname="tests.t" name="test_a[x=1]"><failure message="a"/></testcase>
+        f"""<testsuite name="param">
+          <testcase classname="tests.t" name="test_a[{secret_marker}]"><failure message="a"/></testcase>
           <testcase classname="tests.t" name="test_b[val]"><failure message="b"/></testcase>
           <testcase classname="tests.t" name="test_c[val]"><error message="c"/></testcase>
         </testsuite>""",
@@ -223,6 +241,7 @@ def test_review_regressions_receipt_guard_brackets_corrupt_files_and_traces(tmp_
         run_dir=param_dir,
         fixture_path=param_xml,
         request_id="param-req",
+        operator_approved=True,
         provider_settings=ProviderSettings(
             provider="offline",
             model="offline-deterministic-local",
@@ -231,6 +250,10 @@ def test_review_regressions_receipt_guard_brackets_corrupt_files_and_traces(tmp_
     )
     assert receipt["scenarios"]["pre_commit_crash"]["committed_enqueue_count"] == 1
     assert receipt["scenarios"]["post_commit_crash"]["replay_action"] == "reused"
+    assert not (secret_marker in (param_dir / "receipts.json").read_text(encoding="utf-8")), "secret leaked into receipts.json"
+    assert not (secret_marker in (param_dir / "memory-bundle-param-req-deny.json").read_text(encoding="utf-8")), "secret leaked into MemoryBundle"
+    diag_all_json = json.dumps(diagnose_run(param_dir))
+    assert not (secret_marker in diag_all_json), "secret leaked into diagnose output"
 
     # 3. Reusing the same request_id on the same run_dir is rejected cleanly (no silent fake pass)
     dup_proc = subprocess.run(
@@ -254,7 +277,13 @@ def test_review_regressions_receipt_guard_brackets_corrupt_files_and_traces(tmp_
     )
     assert dup_proc.returncode == 2
 
-    # 4. Seed a real OpenMinion 'context.manifest.created' event and corrupt receipts.json;
+    # 4. Missing receipts.json reports mode='UNKNOWN' (never mislabels an interrupted live run as OFFLINE_REPLAY)
+    (param_dir / "receipts.json").unlink()
+    missing_diag = diagnose_run(param_dir, request_id="param-req-post")
+    assert missing_diag["mode"] == "UNKNOWN"
+    assert "receipt_error" in missing_diag
+
+    # 5. Seed a real OpenMinion 'context.manifest.created' event and corrupt receipts.json;
     # diagnose must still succeed on queue.sqlite, count the trace, and reject malformed bundles.
     with sqlite3.connect(param_dir / "openminion.sqlite") as conn:
         conn.execute(
@@ -267,6 +296,7 @@ def test_review_regressions_receipt_guard_brackets_corrupt_files_and_traces(tmp_
 
     diag = diagnose_run(param_dir, request_id="param-req-post")
     assert diag["exact_once_ok"] is True
+    assert diag["mode"] == "UNKNOWN"
     assert diag["context_traces"]["available"] is True
     assert diag["context_traces"]["trace_count"] == 1
     assert diag["memory_bundle_verified"] is False

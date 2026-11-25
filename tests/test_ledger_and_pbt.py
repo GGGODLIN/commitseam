@@ -253,27 +253,48 @@ def test_denial_non_mutation_and_memory_bundle_export_redaction(tmp_path: Path) 
     assert len(events) == 1
     assert events[0]["result"] == "denied"
 
-    # Export MemoryBundle with synthetic secret markers in metadata; must be read-only & redacted
+    # Export MemoryBundle with synthetic secret markers in ledger item_id & redactor; must be read-only & redacted
     fake_secret = "FAKE_SECRET_TOKEN_999"
     fake_api_key = "sk" + "-live-synthetic-1234567890"
     fake_home = "/" + "Users" + "/demo_operator"
+    secret_item = FailureItem(
+        item_id=f"tests.test_s::test_leak_{fake_secret}",
+        test_name=f"test_leak_{fake_secret}",
+        classname="tests.test_s",
+        failure_kind="failure",
+        message="m",
+        payload_digest="abcd1234abcd1234",
+    )
+    ledger.register_expected("req-deny", [secret_item])
+    ledger.record_denial(
+        request_id="req-deny",
+        item_id=secret_item.item_id,
+        attempt_id="att-deny-2",
+        session_id="sess-deny-2",
+    )
     pending_before = ledger.pending_items("req-deny")
     bundle, serialized = export_memory_bundle(
         ledger,
         request_id="req-deny",
         mode="OFFLINE_REPLAY",
-        metadata={
-            "note": f"authorization Bearer {fake_secret}",
-            "api_key": fake_api_key,
-            "local_path": f"{fake_home}/Desktop/secret.xml",
-        },
+        scenario="approval_denial",
     )
     assert ledger.pending_items("req-deny") == pending_before
     assert not (fake_secret in serialized), "synthetic fake secret leaked into MemoryBundle JSON"
-    assert not (fake_api_key in serialized), "synthetic sk key leaked into MemoryBundle JSON"
-    assert not (fake_home in serialized), "synthetic local home path leaked into MemoryBundle JSON"
+    redacted_extra = json.dumps(
+        redact_secrets(
+            {
+                "note": f"authorization Bearer {fake_secret}",
+                "api_key": fake_api_key,
+                "local_path": f"{fake_home}/Desktop/secret.xml",
+            }
+        )
+    )
+    assert not (fake_api_key in redacted_extra), "synthetic sk key leaked after redaction"
+    assert not (fake_home in redacted_extra), "synthetic local home path leaked after redaction"
     parsed = json.loads(serialized)
     assert parsed["metadata"]["mode"] == "OFFLINE_REPLAY"
+    assert parsed["metadata"]["scenario"] == "approval_denial"
     assert bundle.to_json() == serialized
 
 
@@ -481,15 +502,23 @@ def test_p5_memory_bundle_independence_and_secret_redaction(
     marker = f"FAKE_SECRET_TOKEN_{secret_suffix}"
     with tempfile.TemporaryDirectory() as tmp:
         ledger = QueueLedger(Path(tmp) / "p5.sqlite")
-        item = FailureItem(item_id=item_id, test_name=item_id, classname="tests.pbt", failure_kind="failure", message="m", payload_digest=digest)
+        item = FailureItem(
+            item_id=f"{item_id}_{marker}",
+            test_name=item_id,
+            classname="tests.pbt",
+            failure_kind="failure",
+            message="m",
+            payload_digest=digest,
+        )
         ledger.register_expected(req_id, [item])
+        ledger.record_denial(request_id=req_id, item_id=item.item_id, attempt_id="att-p5")
         pending_before = ledger.pending_items(req_id)
 
         _, serialized = export_memory_bundle(
             ledger,
             request_id=req_id,
             mode="OFFLINE_REPLAY",
-            metadata={"injected": marker, "auth": f"Bearer {marker}"},
+            scenario=f"Bearer {marker}",
         )
         assert ledger.pending_items(req_id) == pending_before
         ok, msg = oracle_check_no_secret_leak(serialized, marker)
@@ -538,14 +567,8 @@ def test_oracle_calibration_catches_known_bad_states() -> None:
 
 def test_regression_blind_verifier_counterexamples(tmp_path: Path) -> None:
     # Counterexample 1: secret marker placed in dict KEY must also be redacted
-    ledger = QueueLedger(tmp_path / "ce.sqlite")
-    _, serialized = export_memory_bundle(
-        ledger,
-        request_id="req-ce",
-        mode="OFFLINE_REPLAY",
-        metadata={"FAKE_SECRET_blind_fixture_123": "plain"},
-    )
-    assert not ("FAKE_SECRET_blind_fixture_123" in serialized), "secret key leaked into MemoryBundle JSON"
+    redacted_dict = json.dumps(redact_secrets({"FAKE_SECRET_blind_fixture_123": "plain"}))
+    assert not ("FAKE_SECRET_blind_fixture_123" in redacted_dict), "secret key leaked after redaction"
 
     # Counterexample 2: duplicate (classname, name) in opposite XML order must yield identical item & digest
     xml_order_a = (

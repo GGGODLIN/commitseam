@@ -288,7 +288,7 @@ class QueueLedger:
     ) -> EnqueueResult:
         seam = FaultMode.coerce(fault_seam)
 
-        def _op(conn: sqlite3.Connection) -> tuple[EnqueueResult | None, InjectedFaultError | None]:
+        def _op(conn: sqlite3.Connection) -> EnqueueResult:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 existing = conn.execute(
@@ -314,16 +314,13 @@ class QueueLedger:
                             (request_id, item_id, attempt_id, session_id, seam.value, existing_job_id),
                         )
                         conn.execute("COMMIT")
-                        return (
-                            EnqueueResult(
-                                action="reused",
-                                request_id=request_id,
-                                item_id=item_id,
-                                job_id=existing_job_id,
-                                recovered_job_id=existing_job_id,
-                                created_by_attempt_id=creator_attempt,
-                            ),
-                            None,
+                        return EnqueueResult(
+                            action="reused",
+                            request_id=request_id,
+                            item_id=item_id,
+                            job_id=existing_job_id,
+                            recovered_job_id=existing_job_id,
+                            created_by_attempt_id=creator_attempt,
                         )
 
                     conn.execute(
@@ -335,17 +332,14 @@ class QueueLedger:
                         (request_id, item_id, attempt_id, session_id, seam.value, existing_job_id),
                     )
                     conn.execute("COMMIT")
-                    return (
-                        EnqueueResult(
-                            action="conflict",
-                            request_id=request_id,
-                            item_id=item_id,
-                            job_id=existing_job_id,
-                            recovered_job_id=existing_job_id,
-                            created_by_attempt_id=creator_attempt,
-                            error_code="ERR_PAYLOAD_CONFLICT",
-                        ),
-                        None,
+                    return EnqueueResult(
+                        action="conflict",
+                        request_id=request_id,
+                        item_id=item_id,
+                        job_id=existing_job_id,
+                        recovered_job_id=existing_job_id,
+                        created_by_attempt_id=creator_attempt,
+                        error_code="ERR_PAYLOAD_CONFLICT",
                     )
 
                 expected_row = conn.execute(
@@ -366,17 +360,14 @@ class QueueLedger:
                         (request_id, item_id, attempt_id, session_id, seam.value),
                     )
                     conn.execute("COMMIT")
-                    return (
-                        EnqueueResult(
-                            action="conflict",
-                            request_id=request_id,
-                            item_id=item_id,
-                            job_id=None,
-                            recovered_job_id=None,
-                            created_by_attempt_id=None,
-                            error_code="ERR_PAYLOAD_CONFLICT",
-                        ),
-                        None,
+                    return EnqueueResult(
+                        action="conflict",
+                        request_id=request_id,
+                        item_id=item_id,
+                        job_id=None,
+                        recovered_job_id=None,
+                        created_by_attempt_id=None,
+                        error_code="ERR_PAYLOAD_CONFLICT",
                     )
 
                 job_id = f"job-{uuid.uuid4().hex[:12]}"
@@ -403,15 +394,12 @@ class QueueLedger:
                         (request_id, item_id, attempt_id, session_id, seam.value),
                     )
                     conn.execute("COMMIT")
-                    return (
-                        None,
-                        InjectedFaultError(
-                            FaultMode.PRE_COMMIT,
-                            request_id=request_id,
-                            item_id=item_id,
-                            attempt_id=attempt_id,
-                            committed_job_id=None,
-                        ),
+                    raise InjectedFaultError(
+                        FaultMode.PRE_COMMIT,
+                        request_id=request_id,
+                        item_id=item_id,
+                        attempt_id=attempt_id,
+                        committed_job_id=None,
                     )
 
                 event_result = "post_commit_crash" if seam == FaultMode.POST_COMMIT else "created"
@@ -428,38 +416,28 @@ class QueueLedger:
                 conn.execute("COMMIT")
 
                 if seam == FaultMode.POST_COMMIT:
-                    return (
-                        None,
-                        InjectedFaultError(
-                            FaultMode.POST_COMMIT,
-                            request_id=request_id,
-                            item_id=item_id,
-                            attempt_id=attempt_id,
-                            committed_job_id=job_id,
-                        ),
-                    )
-
-                return (
-                    EnqueueResult(
-                        action="created",
+                    raise InjectedFaultError(
+                        FaultMode.POST_COMMIT,
                         request_id=request_id,
                         item_id=item_id,
-                        job_id=job_id,
-                        recovered_job_id=None,
-                        created_by_attempt_id=attempt_id,
-                    ),
-                    None,
+                        attempt_id=attempt_id,
+                        committed_job_id=job_id,
+                    )
+
+                return EnqueueResult(
+                    action="created",
+                    request_id=request_id,
+                    item_id=item_id,
+                    job_id=job_id,
+                    recovered_job_id=None,
+                    created_by_attempt_id=attempt_id,
                 )
             except Exception:
                 if conn.in_transaction:
                     conn.execute("ROLLBACK")
                 raise
 
-        result, fault = self._run_with_busy_retry(_op)
-        if fault is not None:
-            raise fault
-        assert result is not None
-        return result
+        return self._run_with_busy_retry(_op)
 
     def attempt_events(self, request_id: str) -> list[dict[str, Any]]:
         def _op(conn: sqlite3.Connection) -> list[dict[str, Any]]:

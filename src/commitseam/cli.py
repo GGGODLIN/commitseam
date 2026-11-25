@@ -28,11 +28,6 @@ def demo(
         "--run-dir",
         help="Directory for isolated SQLite queue DB, OpenMinion session store, and audit bundles.",
     ),
-    fixture: Optional[Path] = typer.Option(
-        None,
-        "--fixture",
-        help="JUnit XML path (defaults to bundled synthetic fixtures/sample_junit.xml).",
-    ),
     request_id: str = typer.Option(
         "demo-run",
         "--request-id",
@@ -66,7 +61,7 @@ def demo(
     ),
 ) -> None:
     """Run approval denial, pre-commit crash (0->1), and post-commit crash (1->1) on sample_junit.xml."""
-    resolved_fixture = fixture if fixture is not None else default_fixture_path()
+    resolved_fixture = default_fixture_path()
     try:
         items = parse_junit_failures(resolved_fixture)
     except (FileNotFoundError, OSError, ValueError) as exc:
@@ -105,6 +100,7 @@ def demo(
             items=items,
             request_id=request_id,
             provider_settings=settings,
+            operator_approved=True,
             receipt_out=receipt_out,
         )
     except (MissingCredentialsError, ValueError, RuntimeError) as exc:

@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Literal
 
 from openminion import (
     APIRuntime,
@@ -37,6 +37,7 @@ TOOL_ENQUEUE_RERUN = "enqueue_rerun"
 TOOL_INSPECT_FAILURE = "inspect_failure"
 HANDOFF_TRIAGE = "triage_failure"
 CONTEXT_MANIFEST_EVENT_TYPE = "context.manifest.created"
+MAX_SEAM_ATTEMPTS = 3
 
 _ITEM_ID_RE = re.compile(r"item_id=(\S+)")
 
@@ -55,10 +56,7 @@ class ProviderSettings:
 
 
 def default_fixture_path() -> Path:
-    packaged = Path(__file__).resolve().parent / "fixtures" / "sample_junit.xml"
-    if packaged.exists():
-        return packaged
-    return Path(__file__).resolve().parents[2] / "fixtures" / "sample_junit.xml"
+    return Path(__file__).resolve().parent / "fixtures" / "sample_junit.xml"
 
 
 def resolve_provider_settings(
@@ -380,8 +378,7 @@ def run_demo(
     items: list[FailureItem] | None = None,
     request_id: str = "demo-run",
     provider_settings: ProviderSettings | None = None,
-    approve_callback: Callable[[str, list[str], Path], bool] | None = None,
-    max_attempts: int = 3,
+    operator_approved: bool = False,
     receipt_out: Path | None = None,
 ) -> dict[str, Any]:
     """Execute the 3 CommitSeam scenarios through real OpenMinion 0.1.24 + isolated SQLite queue."""
@@ -401,20 +398,21 @@ def run_demo(
     om_db = run_dir / "openminion.sqlite"
     ledger = QueueLedger(queue_db)
 
-    for suffix in ("deny", "pre", "post"):
-        candidate_req = f"{request_id}-{suffix}"
+    deny_req = f"{request_id}-deny"
+    pre_req = f"{request_id}-pre"
+    post_req = f"{request_id}-post"
+    for candidate_req in (deny_req, pre_req, post_req):
         if ledger.committed_jobs(candidate_req) or ledger.attempt_events(candidate_req):
             raise ValueError(
                 f"request_id '{request_id}' already exists in {queue_db}; "
                 "use a fresh --request-id or a clean --run-dir to exercise crash seams cleanly."
             )
 
-    # Confirm operator approval up front if a custom callback was supplied.
-    operator_approved = True
-    if approve_callback is not None:
-        operator_approved = bool(
-            approve_callback(request_id, [it.item_id for it in parsed_items], queue_db)
-        )
+    # Persist the complete expected worklist for all 3 scenarios BEFORE turn 1 starts.
+    deny_item, pre_item, post_item = parsed_items[0], parsed_items[1], parsed_items[2]
+    ledger.register_expected(deny_req, [deny_item])
+    ledger.register_expected(pre_req, [pre_item])
+    ledger.register_expected(post_req, [post_item])
 
     loopback: _OfflineLoopbackServer | None = None
     if settings.provider == "offline":
@@ -438,6 +436,7 @@ def run_demo(
         )
 
         items_by_id: dict[str, FailureItem] = {it.item_id: it for it in parsed_items}
+        triage_inspections: list[str] = []
 
         # Mutable per-attempt context consumed by the coordinator tool closure.
         ctx: dict[str, Any] = {
@@ -453,6 +452,7 @@ def run_demo(
         @tool(min_scope="READ_ONLY", idempotent=True)
         def inspect_failure(item_id: str) -> str:
             """Read-only lookup of a parsed JUnit failure item."""
+            triage_inspections.append(item_id)
             item = items_by_id.get(item_id)
             if item is None:
                 return json.dumps({"item_id": item_id, "found": False})
@@ -501,8 +501,9 @@ def run_demo(
         triage_agent = Agent(
             runtime=runtime,
             agent_id="triage",
-            instructions="Inspect failed JUnit testcases read-only using inspect_failure.",
+            instructions=f"Inspect failed JUnit testcases read-only using {TOOL_INSPECT_FAILURE}.",
             tools=[inspect_failure],
+            forced_tools=[TOOL_INSPECT_FAILURE],
         )
         triage_handoff = Handoff(
             triage_agent,
@@ -515,6 +516,15 @@ def run_demo(
         handoff_peer_read_only = (
             len(handoff_write_tools) == 0 and TOOL_INSPECT_FAILURE in triage_agent.tools
         )
+
+        # Exercise the read-only triage peer explicitly before any write turn (0 writes possible).
+        triage_session_id = f"{request_id}-triage-s1"
+        triage_agent.run(
+            f"Classify failed test item_id={deny_item.item_id} using {TOOL_INSPECT_FAILURE}.",
+            session_id=triage_session_id,
+            timeout_seconds=float(settings.timeout_seconds),
+        )
+        triage_peer_invoked = deny_item.item_id in triage_inspections
 
         coord_agent = Agent(
             runtime=runtime,
@@ -589,6 +599,7 @@ def run_demo(
             sdk_error: str | None = None
             reply_text = ""
             retry_idx = 0
+            attempt_t0 = time.monotonic()
 
             while budget[0] > 0:
                 budget[0] -= 1
@@ -623,11 +634,13 @@ def run_demo(
                         break
                     raise
 
+            attempt_duration_ms = int((time.monotonic() - attempt_t0) * 1000)
             last_fault: InjectedFaultError | None = ctx["last_fault"]
             last_result: EnqueueResult | None = ctx["last_result"]
             return {
                 "attempt_id": attempt_id,
                 "session_id": active_session_id,
+                "attempt_duration_ms": attempt_duration_ms,
                 "fault_seam": fault_seam.value,
                 "approval_calls": approval_calls,
                 "injected_fault": last_fault.seam.value if last_fault is not None else None,
@@ -653,9 +666,6 @@ def run_demo(
         # ------------------------------------------------------------------
         # Scenario 1: Approval Denial (0 rows added to rerun_jobs)
         # ------------------------------------------------------------------
-        deny_req = f"{request_id}-deny"
-        deny_item = parsed_items[0]
-        ledger.register_expected(deny_req, [deny_item])
         deny_att = _invoke_attempt(
             req_id=deny_req,
             item=deny_item,
@@ -663,21 +673,18 @@ def run_demo(
             session_id=f"{deny_req}-s1",
             fault_seam=FaultMode.NONE,
             allow_write=False,
-            budget=[max(1, max_attempts)],
+            budget=[MAX_SEAM_ATTEMPTS],
         )
         deny_rec = ledger.reconcile(deny_req)
         _, deny_bundle_json = export_memory_bundle(
-            ledger, request_id=deny_req, mode=mode, metadata={"scenario": "approval_denial"}
+            ledger, request_id=deny_req, mode=mode, scenario="approval_denial"
         )
         (run_dir / f"memory-bundle-{deny_req}.json").write_text(deny_bundle_json + "\n", encoding="utf-8")
 
         # ------------------------------------------------------------------
         # Scenario 2: Seam B — Pre-Commit Crash (0 -> 1 across fresh session_id)
         # ------------------------------------------------------------------
-        pre_req = f"{request_id}-pre"
-        pre_item = parsed_items[1]
-        ledger.register_expected(pre_req, [pre_item])
-        pre_budget = [max(2, max_attempts)]
+        pre_budget = [MAX_SEAM_ATTEMPTS]
         pre_att1 = _invoke_attempt(
             req_id=pre_req,
             item=pre_item,
@@ -703,17 +710,14 @@ def run_demo(
             pre_attempts.append(pre_att2)
         pre_rec = ledger.reconcile(pre_req)
         _, pre_bundle_json = export_memory_bundle(
-            ledger, request_id=pre_req, mode=mode, metadata={"scenario": "pre_commit_crash"}
+            ledger, request_id=pre_req, mode=mode, scenario="pre_commit_crash"
         )
         (run_dir / f"memory-bundle-{pre_req}.json").write_text(pre_bundle_json + "\n", encoding="utf-8")
 
         # ------------------------------------------------------------------
         # Scenario 3: Seam A — Post-Commit Crash (1 -> 1 identical job_id)
         # ------------------------------------------------------------------
-        post_req = f"{request_id}-post"
-        post_item = parsed_items[2]
-        ledger.register_expected(post_req, [post_item])
-        post_budget = [max(2, max_attempts)]
+        post_budget = [MAX_SEAM_ATTEMPTS]
         post_att1 = _invoke_attempt(
             req_id=post_req,
             item=post_item,
@@ -745,12 +749,12 @@ def run_demo(
             post_attempts.append(post_att2)
         post_rec = ledger.reconcile(post_req)
         _, post_bundle_json = export_memory_bundle(
-            ledger, request_id=post_req, mode=mode, metadata={"scenario": "post_commit_crash"}
+            ledger, request_id=post_req, mode=mode, scenario="post_commit_crash"
         )
         (run_dir / f"memory-bundle-{post_req}.json").write_text(post_bundle_json + "\n", encoding="utf-8")
 
         all_sessions = (
-            [deny_att["session_id"]]
+            [triage_session_id, deny_att["session_id"]]
             + [a["session_id"] for a in pre_attempts]
             + [a["session_id"] for a in post_attempts]
         )
@@ -796,6 +800,7 @@ def run_demo(
             "runtime_closed": runtime_closed,
             "handoff_peer_read_only": handoff_peer_read_only,
             "handoff_peer_write_tools": handoff_write_tools,
+            "triage_peer_invoked": triage_peer_invoked,
             "context_traces": context_traces_info,
             "scenarios": {
                 "approval_denial": {
@@ -883,8 +888,11 @@ def diagnose_run(
                 receipt_error = "receipts.json root is not a JSON object"
         except (OSError, json.JSONDecodeError) as exc:
             receipt_error = f"receipts.json parse error: {exc}"
+    else:
+        receipt_error = "receipts.json missing"
 
-    mode = str(saved_receipt.get("mode", "UNKNOWN" if receipt_error else "OFFLINE_REPLAY"))
+    raw_mode = saved_receipt.get("mode")
+    mode = str(raw_mode) if isinstance(raw_mode, str) and raw_mode.strip() else "UNKNOWN"
 
     def _verify_bundle(req_id: str, expected_job_ids: set[str]) -> tuple[bool, str | None]:
         bundle_path = run_dir / f"memory-bundle-{req_id}.json"
