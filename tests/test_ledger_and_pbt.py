@@ -87,7 +87,7 @@ def oracle_check_no_secret_leak(serialized_text: str, marker: str) -> tuple[bool
 
 
 # ---------------------------------------------------------------------------
-# Role 1: Concrete Capability Examples (Ticket 02 Acceptance Batch)
+# Role 1: Concrete Capability Examples (Core Acceptance Suite)
 # ---------------------------------------------------------------------------
 
 def test_junit_parser_deterministic_and_persists_expected_items(tmp_path: Path) -> None:

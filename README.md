@@ -34,7 +34,7 @@ JUnit XML ──▶ Deterministic Parser ──▶ expected_items (SQLite WAL, p
 - **Authoritative local SQLite WAL ledger (`queue.sqlite`)** — strictly isolated from OpenMinion's session store (`openminion.sqlite`).
 - **Single-source recovery** — `pending_items = expected_items(request_id) - committed_jobs(request_id)` is computed strictly from SQLite; replays with identical `payload_digest` return `action="reused"` and the exact original `recovered_job_id`, while mutated digests return `ERR_PAYLOAD_CONFLICT` without mutating the row.
 - **Explicit approval & Handoff safety** — `Handoff` triage peer has strictly `READ_ONLY` tools (since `openminion==0.1.24` `Handoff` does not forward parent `approval_callback`), while the coordinator `Agent` executes writes only through `Agent.run(approval_callback=decide)` bound to `(request_id, item_id, queue_path)`.
-- **Dual-track reproducibility** — `pytest -v` runs 16 offline tests (including 500 Hypothesis property-based test cases across `P1..P5` + independent oracle calibration + real `openminion==0.1.24` over a local deterministic loopback server with `0` API calls), while `commitseam demo --yes` runs against a real LLM (`MODE: LIVE`).
+- **Dual-track reproducibility** — `pytest -v` runs 18 offline tests (including 500 Hypothesis property-based test cases across `P1..P5` + independent oracle calibration + real `openminion==0.1.24` over a local deterministic loopback server with `0` API calls), while `commitseam demo --yes` runs against a real LLM (`MODE: LIVE`).
 
 ## Verified `MODE: LIVE` Results (`openminion==0.1.24` + Groq `openai/gpt-oss-20b`)
 
