@@ -4,6 +4,10 @@
 
 Built for **Cortensor Hackathon #5 (OpenMinion 0.1 SDK Builder Sprint)**.
 
+- **Demo Video (1m 44s, 1080p30)**: https://youtu.be/yDuslZjbTJo
+- **DoraHacks Build**: https://dorahacks.io/build/51952
+- **Upstream Hackathon #5 PR**: https://github.com/cortensor/community-projects/pull/108
+
 ## Problem
 
 When an OpenMinion `0.1.24` agent executes a side-effecting tool (such as enqueueing failed CI tests for rerun), OpenMinion's gateway request deduplication and in-memory `RuntimeEngine` tool cache only mark completion **after** the tool returns and the turn finishes. If a `TurnTimeoutError`, `ProviderError` (such as a post-tool rate limit), or process crash strikes between a local SQLite `COMMIT` and turn return, a naive retry either **duplicates the job (`2` rows instead of `1`)** or **drops an uncommitted job (`0` rows instead of `1`)**.
